@@ -92,3 +92,35 @@ class TestFireworksModelDefaults:
             assert model.startswith("accounts/fireworks/models/"), model
             assert "/routers/" not in model
             assert "turbo" not in model.lower(), model
+
+
+class TestFireworksReasoningDisable:
+    """The endpoint's strict schema rejects any ``reasoning`` body field with HTTP 400
+    ("Extra inputs are not permitted, field: 'reasoning'"), and GLM-5.x is thinking-only
+    (``chat_template_kwargs: {thinking: false}`` is refused too) — a disable is
+    unexpressible on the wire. The profile must therefore own the reasoning projection
+    (omitting the field), never falling through to the generic ``extra_body.reasoning``
+    fallback that 400s every auxiliary disable request."""
+
+    def test_disable_omits_reasoning_field(self, fireworks_profile):
+        extra, top = fireworks_profile.build_api_kwargs_extras(
+            reasoning_config={"enabled": False}, supports_reasoning=True, model=None)
+        assert "reasoning" not in extra and "reasoning" not in top
+
+    def test_profile_handles_reasoning_projection(self, fireworks_profile):
+        # _project_provider_profile treats a profile overriding build_api_kwargs_extras
+        # as reasoning-aware, so the generic extra_body.reasoning fallback never fires.
+        from providers.base import ProviderProfile
+
+        assert type(fireworks_profile).build_api_kwargs_extras is not ProviderProfile.build_api_kwargs_extras
+
+    def test_disable_reaches_the_wire_without_reasoning(self, fireworks_profile):
+        """Full kwargs projection: the wire request for a disable carries no reasoning field."""
+        from agent.auxiliary_client import _build_call_kwargs
+
+        kwargs = _build_call_kwargs(
+            "fireworks", "accounts/fireworks/models/glm-5p3-flash",
+            [{"role": "user", "content": "hi"}], temperature=0.0, max_tokens=16,
+            reasoning_config={"enabled": False}, base_url="https://api.fireworks.ai/inference/v1",
+        )
+        assert "reasoning" not in (kwargs.get("extra_body") or {})
