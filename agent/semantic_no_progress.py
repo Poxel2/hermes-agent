@@ -122,12 +122,14 @@ def ask_results_semantically_identical(args_json: str, results: List[str]) -> Op
         response = call_llm(
             task=_JUDGE_TASK,
             messages=build_judge_messages(args_json, results),
-            max_tokens=64,
+            # Thinking-only deployments (Fireworks GLM-5.x) cannot disable thinking and
+            # spend 200-500 tokens before the verdict; too small a cap truncates the JSON
+            # payload into finish_reason="length" (live-probed: 64 fails, 256 lands).
+            max_tokens=512,
             temperature=0.0,
             timeout=_JUDGE_TIMEOUT_SECONDS,
-            # A verdict is two tokens; thinking would eat the payload like the
-            # title-generation bug class (#91927).
-            reasoning_config={"enabled": False},
+            # reasoning_config deliberately NOT set: a disable is unexpressible on strict
+            # schemas (Fireworks 400s on the field) and thinking-only models ignore it.
         )
     except Exception as exc:
         # "No LLM provider configured" is terminal for the process: the auto-detection
