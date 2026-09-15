@@ -74,6 +74,7 @@ _THRESHOLD_SOURCES: dict[str, tuple[str, str]] = {
     "exact_failure_block_after": ("hard_stop_after", "exact_failure"),
     "same_tool_failure_halt_after": ("hard_stop_after", "same_tool_failure"),
     "no_progress_block_after": ("hard_stop_after", "idempotent_no_progress"),
+    "semantic_no_progress_check_after": ("hard_stop_after", "semantic_no_progress"),
 }
 
 # Per-turn caps on runaway-prone tools (counters reset in reset_for_turn).
@@ -127,6 +128,12 @@ class ToolCallGuardrailConfig:
     same_tool_failure_halt_after: int = 8
     no_progress_warn_after: int = 2
     no_progress_block_after: int = 5
+    # Semantic no-progress check (agent.semantic_no_progress): LLM judges whether the
+    # last N same-args results are semantically identical despite byte noise (pytest
+    # durations, timestamps). 0 disables. Halt lands at the same threshold as the
+    # byte-exact no-progress block; the judge only fires when the byte-exact path
+    # cannot (hashes differ), so legitimate re-reads/re-polls never pay for it.
+    semantic_no_progress_check_after: int = 5
     idempotent_tools: frozenset[str] = field(default_factory=lambda: IDEMPOTENT_TOOL_NAMES)
     mutating_tools: frozenset[str] = field(default_factory=lambda: MUTATING_TOOL_NAMES)
     loop_caps: LoopCapConfig = field(default_factory=LoopCapConfig)
@@ -264,6 +271,11 @@ _DECISION_MESSAGES: dict[str, str] = {
         "arguments and identical results has run {count} times. Repeating the batch unchanged is not "
         "progress; use the results already provided or change strategy."
     ),
+    "semantic_no_progress_halt": (
+        "Stopped {tool_name}: this call ran {count} times with identical arguments and the results "
+        "report the same outcome (only per-run noise such as durations differs). Re-running without a "
+        "change is not progress; change strategy or fix the underlying failure."
+    ),
     "loop_web_search_cap": (
         "Blocked web_search: this turn has already made {cap} web searches, the per-turn limit. "
         "This looks like a runaway search loop. Work with the results you already have and give the user your answer."
@@ -320,6 +332,11 @@ class ToolCallGuardrailController:
         self._identical_streak_result_hash: str = ""
         self._identical_streak_count: int = 0
         self._identical_streak_first_call_id: str = ""
+        # Semantic no-progress evidence (agent.semantic_no_progress): recent results of the
+        # CURRENT same-args streak plus whether the LLM judge already halted on them.
+        self._semantic_streak_results: list[str] = []
+        self._semantic_streak_args: Mapping[str, Any] = {}
+        self._semantic_halt_fired: bool = False
         # Batch-cycle loop breaker (port of can1357/oh-my-pi#10521): sequence of
         # (signature, result_hash, repeatable) for every observed call this turn, so a repeating
         # multi-call cycle (A,B,A,B,...) is caught even though it resets the consecutive streak above.
@@ -477,7 +494,66 @@ class ToolCallGuardrailController:
         stub = None
         if is_plain_str and count >= 2 and not failed and len(result) >= IDENTICAL_RESULT_STUB_MIN_CHARS:
             stub = self._build_result_reference_stub(tool_name, args)
+        self._check_semantic_no_progress(tool_name, signature, result if is_plain_str else "", failed, args)
         return IdenticalCallObservation(notice=notice, stub=stub)
+
+    def _check_semantic_no_progress(
+        self, tool_name: str, signature: ToolCallSignature, result: str, failed: bool,
+        args: Mapping[str, Any],
+    ) -> None:
+        """LLM-judged no-progress halt for byte-NOISY same-args streaks.
+
+        The byte-exact streak above (period 1) and the cycle detector (period 2..4) only fire on
+        result-hash EQUALITY. A failed pytest rerun with a per-run duration in the output never
+        matches, so the loop ran to the budget (Run37: 396 identical-args calls, 42 minutes).
+        This check tracks the consecutive same-(tool, args) streak's recent results and — once the
+        count reaches ``semantic_no_progress_check_after`` — asks the auxiliary LLM whether they
+        are semantically identical. Fail-open: no judge / unparsable verdict / judge-differs
+        never halts; the streak's recent-result buffer resets with it.
+        """
+        if (
+            not self.config.hard_stop_enabled
+            or self._semantic_halt_fired
+            or self.config.semantic_no_progress_check_after <= 0
+            or tool_name not in FAILURE_TOLERANT_TOOL_NAMES
+            or tool_name in STALL_GUARD_REPEATABLE_TOOLS
+            or is_stall_guard_repeatable(tool_name)
+        ):
+            return
+        # Track the raw recent results of the CURRENT consecutive same-args streak; a different
+        # signature reset the streak state above, so mirror it here.
+        if signature != self._identical_streak_sig or not isinstance(result, str):
+            self._semantic_streak_results = []
+            self._semantic_streak_args = {}
+            return
+        self._semantic_streak_args = args
+        self._semantic_streak_results.append(result)
+        # Threshold gates on the SEMANTIC same-args streak length (the byte-exact
+        # `_identical_streak_count` resets on every result-hash change, which is
+        # precisely the shape this check exists to catch).
+        if len(self._semantic_streak_results) < self.config.semantic_no_progress_check_after:
+            return
+        # Only the byte-noisy shape reaches here: hash-equal streaks were already
+        # halted by identical_call_streak_halt at no_progress_block_after. The judge
+        # needs the canonical args kept alongside the streak.
+        evidence = self._semantic_streak_results[-3:]
+        if len(evidence) < 2:
+            return
+        verdict = self._semantic_judge_verdict(evidence)
+        if verdict is True:
+            self._semantic_halt_fired = True
+            self._decide("halt", "semantic_no_progress_halt", tool_name, len(self._semantic_streak_results), signature)
+
+    def _semantic_judge_verdict(self, evidence: list[str]) -> bool | None:
+        """Ask the auxiliary LLM whether the streak's recent results are semantically identical."""
+        from agent import semantic_no_progress
+
+        args_json = canonical_tool_args(_coerce_args(self._semantic_streak_args))
+        try:
+            return semantic_no_progress.ask_results_semantically_identical(args_json, evidence)
+        except Exception:
+            logger.debug("semantic no-progress judge crashed", exc_info=True)
+            return None
 
     def _detect_identical_cycle(self) -> tuple[int, int] | None:
         """Detect a repeating identical-call cycle ending at the latest observed call.
